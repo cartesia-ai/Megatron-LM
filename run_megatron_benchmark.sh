@@ -9,8 +9,11 @@
 #     --model-size 8b --strategy optim_grads_params
 #
 # Arguments:
-#   --model-size   : 1b, 3b, or 8b (LLaMA architecture)
+#   --model-size   : 1b, 3b, 8b, or 8b-moe (LLaMA / MoE architecture)
 #   --strategy     : ddp, optim, optim_grads, optim_grads_params, hsdp
+#   --tp-size N    : tensor model parallel size (default: 1)
+#   --cp-size N    : context parallel size (default: 1)
+#   --ep-size N    : expert model parallel size (default: 1, requires MoE model)
 
 set -e
 
@@ -21,6 +24,9 @@ MEGATRON_DIR="/home/dwromero/projects/fsdp-bench/megatron-lm"
 # ============================================================================
 MODEL_SIZE=""
 STRATEGY=""
+TP_SIZE=1
+CP_SIZE=1
+EP_SIZE=1
 REMAINING_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -32,6 +38,18 @@ while [[ $# -gt 0 ]]; do
             STRATEGY="$2"
             shift 2
             ;;
+        --tp-size)
+            TP_SIZE="$2"
+            shift 2
+            ;;
+        --cp-size)
+            CP_SIZE="$2"
+            shift 2
+            ;;
+        --ep-size)
+            EP_SIZE="$2"
+            shift 2
+            ;;
         *)
             REMAINING_ARGS+=("$1")
             shift
@@ -41,7 +59,7 @@ done
 
 if [[ -z "$MODEL_SIZE" ]] || [[ -z "$STRATEGY" ]]; then
     echo "ERROR: --model-size and --strategy are required"
-    echo "Usage: run_megatron_benchmark.sh --model-size {1b,3b,8b} --strategy {ddp,optim,optim_grads,optim_grads_params,hsdp}"
+    echo "Usage: run_megatron_benchmark.sh --model-size {1b,3b,8b,8b-moe} --strategy {ddp,optim,optim_grads,optim_grads_params,hsdp} [--tp-size N] [--cp-size N] [--ep-size N]"
     exit 1
 fi
 
@@ -78,6 +96,7 @@ echo "=== Environment ==="
 python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}')"
 echo "Model size: $MODEL_SIZE"
 echo "Strategy: $STRATEGY"
+echo "TP=$TP_SIZE, CP=$CP_SIZE, EP=$EP_SIZE"
 
 # ============================================================================
 # SLURM / distributed setup
@@ -135,6 +154,7 @@ LLAMA_ARGS=(
 )
 
 WORLD_SIZE=$((NNODES * NPROC_PER_NODE))
+MOE_ARGS=()
 
 case "$MODEL_SIZE" in
     1b)
@@ -149,7 +169,6 @@ case "$MODEL_SIZE" in
             --max-position-embeddings 2048
         )
         MICRO_BATCH_SIZE=2
-        GLOBAL_BATCH_SIZE=$((MICRO_BATCH_SIZE * WORLD_SIZE))
         ;;
     3b)
         # LLaMA 3.2 3B configuration
@@ -164,7 +183,6 @@ case "$MODEL_SIZE" in
             --max-position-embeddings 2048
         )
         MICRO_BATCH_SIZE=1
-        GLOBAL_BATCH_SIZE=$((MICRO_BATCH_SIZE * WORLD_SIZE))
         ;;
     8b)
         # LLaMA 3.1 8B configuration
@@ -178,13 +196,56 @@ case "$MODEL_SIZE" in
             --max-position-embeddings 2048
         )
         MICRO_BATCH_SIZE=1
-        GLOBAL_BATCH_SIZE=$((MICRO_BATCH_SIZE * WORLD_SIZE))
+        ;;
+    8b-moe)
+        # Mixtral-style MoE: LLaMA 8B backbone + 8 experts, top-k=2
+        # Dense params ~8B, total with experts much larger
+        # Uses --num-experts 8 and MoE-specific args
+        MODEL_ARGS=(
+            --num-layers 32
+            --hidden-size 4096
+            --ffn-hidden-size 14336
+            --num-attention-heads 32
+            --kv-channels 128
+            --seq-length 2048
+            --max-position-embeddings 2048
+        )
+        MOE_ARGS=(
+            --num-experts 8
+            --moe-router-topk 2
+            --moe-router-load-balancing-type aux_loss
+            --moe-aux-loss-coeff 1e-2
+            --moe-token-dispatcher-type alltoall
+        )
+        MICRO_BATCH_SIZE=1
         ;;
     *)
-        echo "ERROR: Unknown model size '$MODEL_SIZE'. Use '1b', '3b', or '8b'."
+        echo "ERROR: Unknown model size '$MODEL_SIZE'. Use '1b', '3b', '8b', or '8b-moe'."
         exit 1
         ;;
 esac
+
+# ============================================================================
+# TP / CP / EP parallelism args
+# ============================================================================
+PARALLEL_ARGS=()
+
+if [[ "$TP_SIZE" -gt 1 ]]; then
+    PARALLEL_ARGS+=(--tensor-model-parallel-size "$TP_SIZE")
+fi
+
+if [[ "$CP_SIZE" -gt 1 ]]; then
+    PARALLEL_ARGS+=(--context-parallel-size "$CP_SIZE")
+fi
+
+if [[ "$EP_SIZE" -gt 1 ]]; then
+    PARALLEL_ARGS+=(--expert-model-parallel-size "$EP_SIZE")
+fi
+
+# Compute DP size: WORLD_SIZE / (TP * CP)
+# EP is carved from the FSDP dimension, not from DP directly
+DP_SIZE=$((WORLD_SIZE / (TP_SIZE * CP_SIZE)))
+GLOBAL_BATCH_SIZE=$((MICRO_BATCH_SIZE * DP_SIZE))
 
 # ============================================================================
 # Sharding strategy configuration
@@ -269,6 +330,20 @@ case "$STRATEGY" in
 esac
 
 # ============================================================================
+# CUDA_DEVICE_MAX_CONNECTIONS handling for TP/CP + FSDP
+# ============================================================================
+# TP and CP need CUDA_DEVICE_MAX_CONNECTIONS=1 for sequence parallelism overlap.
+# FSDP asserts CUDA_DEVICE_MAX_CONNECTIONS != 1.
+# On pre-Blackwell (H100), this is a known conflict. FSDP's assert is hard,
+# so we must unset it when FSDP is active. Megatron prints a warning but proceeds.
+if [[ ("$TP_SIZE" -gt 1 || "$CP_SIZE" -gt 1) && "$STRATEGY" != "ddp" ]]; then
+    echo "WARNING: TP=$TP_SIZE / CP=$CP_SIZE with FSDP strategy '$STRATEGY'."
+    echo "  CUDA_DEVICE_MAX_CONNECTIONS must be unset for FSDP (hard assert)."
+    echo "  TP/CP sequence parallelism overlap may be suboptimal on H100."
+    unset CUDA_DEVICE_MAX_CONNECTIONS
+fi
+
+# ============================================================================
 # Training configuration
 # ============================================================================
 TRAINING_ARGS=(
@@ -306,9 +381,10 @@ DATA_ARGS=(
 # Launch
 # ============================================================================
 echo "=== Launch Configuration ==="
-echo "  Model: LLaMA $MODEL_SIZE"
+echo "  Model: $MODEL_SIZE"
 echo "  Strategy: $STRATEGY"
-echo "  World size: $WORLD_SIZE"
+echo "  TP=$TP_SIZE, CP=$CP_SIZE, EP=$EP_SIZE"
+echo "  World size: $WORLD_SIZE (DP=$DP_SIZE)"
 echo "  Micro batch size: $MICRO_BATCH_SIZE"
 echo "  Global batch size: $GLOBAL_BATCH_SIZE"
 echo "  CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-<unset>}"
@@ -327,6 +403,8 @@ torchrun \
     pretrain_gpt.py \
     "${LLAMA_ARGS[@]}" \
     "${MODEL_ARGS[@]}" \
+    "${MOE_ARGS[@]}" \
+    "${PARALLEL_ARGS[@]}" \
     "${TRAINING_ARGS[@]}" \
     "${STRATEGY_ARGS[@]}" \
     "${DATA_ARGS[@]}" \
