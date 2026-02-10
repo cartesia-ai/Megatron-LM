@@ -79,6 +79,17 @@ fi
 rm -f "$SENTINEL"
 
 # ============================================================================
+# Determine if TransformerEngine is needed
+# ============================================================================
+# TP, CP, and EP in Megatron-Core require TransformerEngine (TEDotProductAttention
+# for CP, te_general_gemm for MoE routing, TE layers for TP + FSDP composition).
+# Pure FSDP benchmarks (TP=CP=EP=1) use --transformer-impl local to avoid the dep.
+USE_TE=0
+if [[ "$TP_SIZE" -gt 1 || "$CP_SIZE" -gt 1 || "$EP_SIZE" -gt 1 ]]; then
+    USE_TE=1
+fi
+
+# ============================================================================
 # Install Megatron-Core (and remove Apex to avoid FusedLayerNorm issues)
 # ============================================================================
 echo "=== Installing Megatron-Core ==="
@@ -89,11 +100,53 @@ cd "$MEGATRON_DIR"
 pip uninstall -y apex 2>/dev/null || true
 
 pip install --quiet -e . 2>&1 | tail -5
+
+# ============================================================================
+# Install TransformerEngine if needed (for TP/CP/EP)
+# ============================================================================
+if [[ "$USE_TE" -eq 1 ]]; then
+    echo "=== Installing TransformerEngine (required for TP/CP/EP) ==="
+    # 1. Meta package + core CUDA library (prebuilt wheel, ~288 MB)
+    pip install --quiet transformer-engine==2.11.0 transformer-engine-cu12==2.11.0 2>&1 | tail -3
+    # 2. Missing dependency for TE 2.11
+    pip install --quiet onnxscript 2>&1 | tail -3
+    # 3. PyTorch bindings (needs compilation; cuDNN headers from pip aren't on default include path)
+    #    Find cuDNN include dir: check nvidia.cudnn pip package, then common system paths
+    CUDNN_INCLUDE=""
+    for candidate in \
+        "$(python -c 'import nvidia.cudnn, os; print(os.path.join(os.path.dirname(nvidia.cudnn.__file__), "include"))' 2>/dev/null)" \
+        "$(python -c 'import nvidia.cudnn; print(nvidia.cudnn.__path__[0])' 2>/dev/null)/include" \
+        "/usr/local/cuda/include" \
+        "/usr/include"; do
+        if [[ -f "$candidate/cudnn.h" ]]; then
+            CUDNN_INCLUDE="$candidate"
+            break
+        fi
+    done
+    if [[ -z "$CUDNN_INCLUDE" ]]; then
+        # Fallback: search site-packages for nvidia/cudnn/include
+        CUDNN_INCLUDE=$(find "$(python -c 'import site; print(site.getsitepackages()[0])')" -path "*/nvidia/cudnn/include/cudnn.h" -printf "%h" -quit 2>/dev/null || echo "")
+    fi
+    if [[ -z "$CUDNN_INCLUDE" ]]; then
+        echo "ERROR: Could not find cudnn.h for TransformerEngine compilation"
+        exit 1
+    fi
+    echo "  cuDNN include path: $CUDNN_INCLUDE"
+    CPLUS_INCLUDE_PATH="$CUDNN_INCLUDE:${CPLUS_INCLUDE_PATH:-}" \
+    C_INCLUDE_PATH="$CUDNN_INCLUDE:${C_INCLUDE_PATH:-}" \
+    pip install --quiet --no-build-isolation transformer-engine-torch==2.11.0 2>&1 | tail -3
+    # Verify
+    python -c "from transformer_engine.pytorch import TransformerLayer; print('TransformerEngine import OK')"
+fi
+
 python -c "import megatron; print('Megatron-Core import OK')" || \
     python -c "from megatron.training import pretrain; print('Megatron pretrain import OK')"
 
 echo "=== Environment ==="
 python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}')"
+if [[ "$USE_TE" -eq 1 ]]; then
+    python -c "import transformer_engine; print(f'TransformerEngine {transformer_engine.__version__}')"
+fi
 echo "Model size: $MODEL_SIZE"
 echo "Strategy: $STRATEGY"
 echo "TP=$TP_SIZE, CP=$CP_SIZE, EP=$EP_SIZE"
@@ -130,28 +183,48 @@ echo "NNODES=$NNODES, NPROC=$NPROC_PER_NODE, NODE_RANK=$NODE_RANK"
 # Model configuration (LLaMA architecture)
 # ============================================================================
 # Common LLaMA flags
-# NOTE: We use --transformer-impl local (MCore native) instead of transformer_engine
-# to avoid the TransformerEngine dependency. We also disable fused RoPE (--no-rope-fusion)
-# since it requires TE >= 1.4.
-LLAMA_ARGS=(
-    --transformer-impl local
-    --position-embedding-type rope
-    --rotary-base 500000
-    --rotary-percent 1.0
-    --no-rope-fusion
-    --swiglu
-    --normalization RMSNorm
-    --group-query-attention
-    --num-query-groups 8
-    --untie-embeddings-and-output-weights
-    --disable-bias-linear
-    --attention-dropout 0.0
-    --hidden-dropout 0.0
-    --no-position-embedding
-    --no-masked-softmax-fusion
-    --attention-softmax-in-fp32
-    --no-persist-layer-norm
-)
+# When TP/CP/EP > 1, we use TransformerEngine (--transformer-impl transformer_engine)
+# because Megatron's TP, CP, and EP require TE's fused kernels.
+# For pure FSDP benchmarks, we use --transformer-impl local to keep things simple.
+if [[ "$USE_TE" -eq 1 ]]; then
+    LLAMA_ARGS=(
+        --transformer-impl transformer_engine
+        --position-embedding-type rope
+        --rotary-base 500000
+        --rotary-percent 1.0
+        --swiglu
+        --normalization RMSNorm
+        --group-query-attention
+        --num-query-groups 8
+        --untie-embeddings-and-output-weights
+        --disable-bias-linear
+        --attention-dropout 0.0
+        --hidden-dropout 0.0
+        --no-position-embedding
+        --no-masked-softmax-fusion
+        --attention-softmax-in-fp32
+    )
+else
+    LLAMA_ARGS=(
+        --transformer-impl local
+        --position-embedding-type rope
+        --rotary-base 500000
+        --rotary-percent 1.0
+        --no-rope-fusion
+        --swiglu
+        --normalization RMSNorm
+        --group-query-attention
+        --num-query-groups 8
+        --untie-embeddings-and-output-weights
+        --disable-bias-linear
+        --attention-dropout 0.0
+        --hidden-dropout 0.0
+        --no-position-embedding
+        --no-masked-softmax-fusion
+        --attention-softmax-in-fp32
+        --no-persist-layer-norm
+    )
+fi
 
 WORLD_SIZE=$((NNODES * NPROC_PER_NODE))
 MOE_ARGS=()
