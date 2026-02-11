@@ -24,7 +24,8 @@
 set -euo pipefail
 
 GYPSUM_DIR="${GYPSUM_DIR:-$HOME/projects/gypsum}"
-BENCHMARK_SCRIPT="$HOME/projects/fsdp-bench/megatron-lm/run_megatron_benchmark.sh"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BENCHMARK_SCRIPT="${SCRIPT_DIR}/run_megatron_benchmark.sh"
 
 # Defaults
 DRY_RUN=0

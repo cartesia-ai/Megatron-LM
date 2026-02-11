@@ -17,7 +17,7 @@
 
 set -e
 
-MEGATRON_DIR="/home/dwromero/projects/fsdp-bench/megatron-lm"
+MEGATRON_DIR="${MEGATRON_DIR:-$(cd "$(dirname "$0")" && pwd)}"
 
 # ============================================================================
 # Parse arguments
