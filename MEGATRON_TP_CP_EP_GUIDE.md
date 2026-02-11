@@ -53,6 +53,57 @@ cd ~/projects/fsdp-bench/megatron-lm
 - **Effect**: EP is carved from the FSDP dimension (EP=2 means experts are split across 2 GPUs)
 - **Requires**: TransformerEngine (`--transformer-impl transformer_engine`)
 
+## Batch Size Computation
+
+Batch sizes are **computed dynamically** by `run_megatron_benchmark.sh` based on the model and parallelism dimensions. This is critical — getting it wrong causes Megatron to error or silently produce wrong results.
+
+### Formula
+
+```
+DP_SIZE = WORLD_SIZE / (TP_SIZE × CP_SIZE)
+GLOBAL_BATCH_SIZE = MICRO_BATCH_SIZE × DP_SIZE
+```
+
+- `MICRO_BATCH_SIZE` is set per model: **1** for 8B and 8B-MoE, **2** for 1B, **1** for 3B
+- EP does **not** reduce DP_SIZE — it's carved from the FSDP sharding dimension, not from DP
+- HSDP does **not** change DP_SIZE either — it only changes how the DP group is sharded internally
+
+### Concrete Values for TP/CP/EP Experiments
+
+All TP/CP/EP experiments use 8B or 8B-MoE, so `MICRO_BATCH_SIZE = 1` in all cases.
+
+**TP=2 (LLaMA 8B, micro_batch=1):**
+
+| Nodes | GPUs | DP_SIZE = GPUs/(TP×CP) | GLOBAL_BATCH_SIZE |
+|-------|------|------------------------|-------------------|
+| 1     | 8    | 8 / 2 = **4**          | 1 × 4 = **4**    |
+| 2     | 16   | 16 / 2 = **8**         | 1 × 8 = **8**    |
+| 4     | 32   | 32 / 2 = **16**        | 1 × 16 = **16**  |
+
+**CP=2 (LLaMA 8B, micro_batch=1):**
+
+| Nodes | GPUs | DP_SIZE = GPUs/(TP×CP) | GLOBAL_BATCH_SIZE |
+|-------|------|------------------------|-------------------|
+| 1     | 8    | 8 / 2 = **4**          | 1 × 4 = **4**    |
+| 2     | 16   | 16 / 2 = **8**         | 1 × 8 = **8**    |
+| 4     | 32   | 32 / 2 = **16**        | 1 × 16 = **16**  |
+
+**EP=2 (8B-MoE, micro_batch=1):**
+
+| Nodes | GPUs | DP_SIZE = GPUs/(TP×CP) | GLOBAL_BATCH_SIZE |
+|-------|------|------------------------|-------------------|
+| 1     | 8    | 8 / 1 = **8**          | 1 × 8 = **8**    |
+| 2     | 16   | 16 / 1 = **16**        | 1 × 16 = **16**  |
+| 4     | 32   | 32 / 1 = **32**        | 1 × 32 = **32**  |
+
+> **Note**: EP=2 has the same DP_SIZE as pure FSDP (no TP/CP), so the global batch size is larger than TP=2 or CP=2 at the same node count. EP splits the *experts* across 2 GPUs but all GPUs still participate in data parallelism.
+
+### Memory Implications
+
+- **TP=2 reduces per-GPU parameter memory** — each GPU holds half the model. This is why TP=2+DDP fits (75.2 GiB) while pure DDP OOMs.
+- **CP=2 does NOT reduce per-GPU parameter memory** — it splits the sequence, not the model. With DP_SIZE halved (4 instead of 8 on 1N), FSDP shards across fewer GPUs → *more* memory per GPU. This is why CP=2 at 1N is tight.
+- **EP=2 reduces expert memory** — each GPU holds 4 of 8 experts instead of all 8. But the dense backbone (attention, embeddings) is still fully replicated in DDP or sharded in FSDP.
+
 ## Exact Invocation Chain
 
 ### 1. `submit_megatron_benchmarks.sh` calls `gypsum/scripts/sbatch.sh`
